@@ -161,9 +161,7 @@ fn ssh_password(workspace: &WorkspaceEnv) -> Option<&str> {
 
 pub(crate) type SshAuthOptions = (Vec<String>, Vec<(String, String)>);
 
-pub(crate) fn ssh_auth_options(
-    workspace: &WorkspaceEnv,
-) -> Result<SshAuthOptions, String> {
+pub(crate) fn ssh_auth_options(workspace: &WorkspaceEnv) -> Result<SshAuthOptions, String> {
     let mut args = vec!["-o".into(), "StrictHostKeyChecking=accept-new".into()];
     args.extend(ssh_multiplex_options()?);
     if let Some(password) = ssh_password(workspace) {
@@ -1188,8 +1186,11 @@ mod tests {
             password: Some("secret".into()),
         };
         let (args, envs) = ssh_auth_options(&workspace).expect("options");
-        assert!(args.windows(2).any(|w| w == ["-o", "ControlMaster=auto"]));
-        assert!(args.windows(2).any(|w| w == ["-o", "ControlPersist=10m"]));
+        #[cfg(unix)]
+        {
+            assert!(args.windows(2).any(|w| w == ["-o", "ControlMaster=auto"]));
+            assert!(args.windows(2).any(|w| w == ["-o", "ControlPersist=10m"]));
+        }
         assert!(args.windows(2).any(|w| w == ["-o", "BatchMode=no"]));
         assert!(args
             .windows(2)
@@ -1215,8 +1216,11 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|w| w == ["-o", "StrictHostKeyChecking=accept-new"]));
-        assert!(args.windows(2).any(|w| w == ["-o", "ControlMaster=auto"]));
-        assert!(args.windows(2).any(|w| w == ["-o", "ControlPersist=10m"]));
+        #[cfg(unix)]
+        {
+            assert!(args.windows(2).any(|w| w == ["-o", "ControlMaster=auto"]));
+            assert!(args.windows(2).any(|w| w == ["-o", "ControlPersist=10m"]));
+        }
         assert!(args.windows(2).any(|w| w == ["-o", "BatchMode=yes"]));
         assert!(envs.is_empty());
     }

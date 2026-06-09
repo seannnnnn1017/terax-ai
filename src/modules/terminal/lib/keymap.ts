@@ -4,7 +4,10 @@ export type TerminalKeyEvent = Pick<
 >;
 
 export type PlatformOpts = { isMac: boolean };
-export type ClipboardOpts = PlatformOpts & { hasSelection: boolean };
+export type ClipboardOpts = PlatformOpts & {
+  hasSelection: boolean;
+  plainCtrlVPaste?: boolean;
+};
 export type TerminalClipboardAction = "copy" | "paste" | null;
 
 export function terminalClipboardAction(
@@ -25,7 +28,7 @@ export function terminalClipboardAction(
 
   if (!event.ctrlKey || event.altKey || event.metaKey) return null;
   if (isC && (event.shiftKey || opts.hasSelection)) return "copy";
-  if (isV && event.shiftKey) return "paste";
+  if (isV && (event.shiftKey || opts.plainCtrlVPaste)) return "paste";
   return null;
 }
 

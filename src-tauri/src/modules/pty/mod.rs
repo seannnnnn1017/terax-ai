@@ -13,8 +13,10 @@ use std::thread;
 
 use portable_pty::PtySize;
 use tauri::ipc::{Channel, Response};
+use tauri::Emitter;
 
 use crate::modules::workspace::{authorize_user_spawn_cwd, WorkspaceEnv, WorkspaceRegistry};
+use agent_detect::Transition;
 use session::Session;
 
 pub struct PtyState {
@@ -70,7 +72,12 @@ pub async fn pty_open(
 }
 
 #[tauri::command]
-pub fn pty_write(state: tauri::State<PtyState>, id: u32, data: String) -> Result<(), String> {
+pub fn pty_write(
+    app: tauri::AppHandle,
+    state: tauri::State<PtyState>,
+    id: u32,
+    data: String,
+) -> Result<(), String> {
     let session = state
         .sessions
         .read()
@@ -83,6 +90,25 @@ pub fn pty_write(state: tauri::State<PtyState>, id: u32, data: String) -> Result
         })?;
     // Bind to a local so the MutexGuard temporary drops before `session` —
     // see rustc note on tail-expression temporary drop order.
+    let first_input_after = session.diagnostics.mark_first_input();
+    if let Some(elapsed) = first_input_after {
+        log::info!(
+            "pty first input id={id} received after {}ms bytes={}",
+            elapsed.as_millis(),
+            data.len()
+        );
+    }
+    let first_interactive_after = session
+        .diagnostics
+        .mark_first_interactive_input(data.as_bytes());
+    if let Some(elapsed) = first_interactive_after {
+        log::info!(
+            "pty first interactive input id={id} received after {}ms bytes={}",
+            elapsed.as_millis(),
+            data.len()
+        );
+    }
+    let write_started = std::time::Instant::now();
     let result = session
         .writer
         .lock()
@@ -93,6 +119,27 @@ pub fn pty_write(state: tauri::State<PtyState>, id: u32, data: String) -> Result
             log::debug!("pty_write id={id} failed: {e}");
             e.to_string()
         });
+    if first_input_after.is_some() {
+        log::info!(
+            "pty first input id={id} write completed in {}ms ok={}",
+            write_started.elapsed().as_millis(),
+            result.is_ok()
+        );
+    }
+    if first_interactive_after.is_some() {
+        log::info!(
+            "pty first interactive input id={id} write completed in {}ms ok={}",
+            write_started.elapsed().as_millis(),
+            result.is_ok()
+        );
+    }
+    if result.is_ok()
+        && session
+            .agent_input_state
+            .mark_working_from_input(data.as_bytes())
+    {
+        let _ = app.emit(session::AGENT_EVENT, Transition::Working.into_signal(id));
+    }
     result
 }
 

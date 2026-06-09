@@ -24,6 +24,7 @@ import {
   AiInputBar,
   AiInputBarConnect,
   AiMiniWindow,
+  getAllCustomEndpointKeys,
   LocalAgentNotificationsBridge,
   SelectionAskAi,
   useChatStore,
@@ -39,6 +40,7 @@ import {
   type ProviderId,
 } from "@/modules/ai/config";
 import { AiComposerProvider } from "@/modules/ai/lib/composer";
+import { hydrateCustomEndpointKeys } from "@/modules/ai/lib/customEndpointKeyHydration";
 import { redactSensitive } from "@/modules/ai/lib/redact";
 import { native } from "@/modules/ai/lib/native";
 import { buildTerminalInventory } from "@/modules/ai/lib/terminalInventory";
@@ -106,6 +108,14 @@ import {
   type TerminalPaneHandle,
   useTerminalFileDrop,
 } from "@/modules/terminal";
+import {
+  classifyTerminalFocusOwner,
+  restoreTerminalFocus,
+} from "@/modules/terminal/lib/focusRecovery";
+import {
+  recoveredTerminalInput,
+  shouldRecoverTerminalInputFocus,
+} from "@/modules/terminal/lib/terminalInputRecovery";
 import { parseSshCommandLine } from "@/modules/terminal/lib/sshCommandTracker";
 import { ThemeProvider } from "@/modules/theme";
 import { listCustomThemes, saveCustomTheme } from "@/modules/theme/customThemes";
@@ -126,6 +136,7 @@ import {
   LOCAL_WORKSPACE,
   sameWorkspaceEnv,
   useWorkspaceEnvStore,
+  workspaceSelectionOpensNewTerminal,
   type WorkspaceEnv,
 } from "@/modules/workspace";
 import { invoke } from "@tauri-apps/api/core";
@@ -251,6 +262,7 @@ export default function App() {
     activeId,
     setActiveId,
     newTab,
+    newWorkspaceTab,
     newAgentTab,
     newPrivateTab,
     openFileTab,
@@ -300,6 +312,46 @@ export default function App() {
   useTerminalFileDrop();
   const explorerRef = useRef<FileExplorerHandle>(null);
   const explorerReturnFocusRef = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    if (activeLeafId === null) return;
+    let alive = true;
+    let unlisten: (() => void) | undefined;
+    let focusRaf = 0;
+
+    const restoreFocus = () => {
+      if (focusRaf) cancelAnimationFrame(focusRaf);
+      focusRaf = requestAnimationFrame(() => {
+        focusRaf = 0;
+        if (!alive) return;
+        restoreTerminalFocus(
+          terminalRefs.current.get(activeLeafId) ?? null,
+          classifyTerminalFocusOwner(
+            document.activeElement,
+            document.body,
+            document.documentElement,
+          ),
+        );
+      });
+    };
+
+    if (document.hasFocus()) restoreFocus();
+    getCurrentWebviewWindow()
+      .onFocusChanged(({ payload }) => {
+        if (payload) restoreFocus();
+      })
+      .then((nextUnlisten) => {
+        if (alive) unlisten = nextUnlisten;
+        else nextUnlisten();
+      })
+      .catch(() => {});
+
+    return () => {
+      alive = false;
+      if (focusRaf) cancelAnimationFrame(focusRaf);
+      unlisten?.();
+    };
+  }, [activeLeafId]);
 
   const sidebarRef = useRef<PanelImperativeHandle | null>(null);
   const sidebarWidthRef = useRef(readSidebarWidth());
@@ -440,7 +492,9 @@ export default function App() {
   const switchWorkspace = useCallback(
     async (env: WorkspaceEnv) => {
       const targetTab = tabsRef.current.find((t) => t.id === activeId) ?? null;
+      const opensNewTerminal = workspaceSelectionOpensNewTerminal(env);
       if (
+        !opensNewTerminal &&
         targetTab &&
         sameWorkspaceEnv(env, targetTab.workspace) &&
         !(env.kind === "ssh" && env.password)
@@ -459,6 +513,19 @@ export default function App() {
         }
       } catch (e) {
         window.alert(String(e));
+        return;
+      }
+
+      if (opensNewTerminal) {
+        newWorkspaceTab(env, nextHome ?? undefined);
+        setWorkspaceEnv(env);
+        if (nextHome) {
+          try {
+            await native.workspaceAuthorize(nextHome);
+          } catch {
+            // Non-fatal: git panel will surface "not authorized" if needed.
+          }
+        }
         return;
       }
 
@@ -486,7 +553,13 @@ export default function App() {
       updateTab(targetTab.id, { workspace: env });
       setWorkspaceEnv(env);
     },
-    [activeId, setTerminalTabWorkspace, setWorkspaceEnv, updateTab],
+    [
+      activeId,
+      newWorkspaceTab,
+      setTerminalTabWorkspace,
+      setWorkspaceEnv,
+      updateTab,
+    ],
   );
   useEffect(() => {
     native
@@ -506,6 +579,7 @@ export default function App() {
   const openPanel = useChatStore((s) => s.openPanel);
   const panelOpen = useChatStore((s) => s.panelOpen);
   const setSelectedModelId = useChatStore((s) => s.setSelectedModelId);
+  const setCustomEndpointKeys = useChatStore((s) => s.setCustomEndpointKeys);
   const setLive = useChatStore((s) => s.setLive);
   const respondToApproval = useChatStore((s) => s.respondToApproval);
 
@@ -570,6 +644,14 @@ export default function App() {
         : DEFAULT_CODEX_MODEL_ID,
     );
   }, [keylessModelConfig, prefsHydrated, prefDefaultModel, setSelectedModelId]);
+  useEffect(() => {
+    if (!prefsHydrated) return;
+    void hydrateCustomEndpointKeys(
+      customEndpoints,
+      getAllCustomEndpointKeys,
+      setCustomEndpointKeys,
+    );
+  }, [customEndpoints, prefsHydrated, setCustomEndpointKeys]);
 
   const hydrateSessions = useChatStore((s) => s.hydrateSessions);
   useEffect(() => {
@@ -588,6 +670,33 @@ export default function App() {
   const isGitDiffTab =
     activeTab?.kind === "git-diff" || activeTab?.kind === "git-commit-file";
   const isGitHistoryTab = activeTab?.kind === "git-history";
+
+  useEffect(() => {
+    if (!isTerminalTab || activeLeafId === null) return;
+    const recoverTerminalKey = (event: KeyboardEvent) => {
+      if (event.defaultPrevented) return;
+      if (
+        !shouldRecoverTerminalInputFocus(
+          document.activeElement,
+          document.body,
+        )
+      ) {
+        return;
+      }
+      const input = recoveredTerminalInput(event);
+      if (input === null) return;
+      const term = terminalRefs.current.get(activeLeafId);
+      if (!term) return;
+      event.preventDefault();
+      event.stopPropagation();
+      term.focus();
+      term.write(input);
+    };
+    document.addEventListener("keydown", recoverTerminalKey, true);
+    return () => {
+      document.removeEventListener("keydown", recoverTerminalKey, true);
+    };
+  }, [activeLeafId, isTerminalTab]);
 
   useEffect(() => {
     const nextWorkspace = activeTab?.workspace ?? LOCAL_WORKSPACE;

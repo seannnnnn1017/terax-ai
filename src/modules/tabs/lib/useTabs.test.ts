@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { resolveTerminalWorkspaceUpdate, type TerminalTab } from "./useTabs";
+import {
+  createTerminalTab,
+  resolveTerminalWorkspaceUpdate,
+  type TerminalTab,
+} from "./useTabs";
 import { type WorkspaceEnv } from "@/modules/workspace";
 
 function terminalTab(workspace: WorkspaceEnv): TerminalTab {
@@ -48,5 +52,20 @@ describe("resolveTerminalWorkspaceUpdate", () => {
     });
     expect(next.restartSession).toBe(true);
     expect(next.nextCwd).toBe("/home/sean/Github");
+  });
+});
+
+describe("createTerminalTab", () => {
+  it("creates a WSL terminal directly in the requested workspace", () => {
+    const wsl: WorkspaceEnv = { kind: "wsl", distro: "Ubuntu" };
+    const tab = createTerminalTab(3, 4, "/home/sean", wsl);
+
+    expect(tab.workspace).toEqual(wsl);
+    expect(tab.cwd).toBe("/home/sean");
+    expect(tab.paneTree).toEqual({
+      kind: "leaf",
+      id: 4,
+      cwd: "/home/sean",
+    });
   });
 });

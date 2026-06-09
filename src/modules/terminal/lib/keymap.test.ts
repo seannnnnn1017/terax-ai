@@ -186,4 +186,13 @@ describe("terminalClipboardAction", () => {
       ),
     ).toBe("paste");
   });
+
+  it("pastes with Ctrl+V off macOS when plain Ctrl+V paste is enabled", () => {
+    expect(
+      terminalClipboardAction(
+        evt({ ctrlKey: true, key: "v", code: "KeyV" }),
+        { isMac: false, hasSelection: false, plainCtrlVPaste: true },
+      ),
+    ).toBe("paste");
+  });
 });

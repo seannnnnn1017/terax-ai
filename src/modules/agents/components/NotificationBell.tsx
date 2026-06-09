@@ -15,6 +15,7 @@ import { HugeiconsIcon } from "@hugeicons/react";
 import { invoke } from "@tauri-apps/api/core";
 import { useMemo, useState } from "react";
 import { AgentIcon } from "../lib/agentIcon";
+import { agentStatusLabel } from "../lib/status";
 import type { AgentNotification, AgentStatus } from "../lib/types";
 import { useAgentStore } from "../store/agentStore";
 
@@ -43,6 +44,7 @@ function StatusRow({
   onClick: () => void;
 }) {
   const waiting = status === "waiting";
+  const finished = status === "finished";
   return (
     <button
       type="button"
@@ -62,7 +64,14 @@ function StatusRow({
         )}
       >
         {waiting ? <span className="size-1.5 rounded-full bg-primary" /> : null}
-        {waiting ? "waiting" : "working"}
+        {finished ? (
+          <HugeiconsIcon
+            icon={CheckmarkCircle02Icon}
+            size={13}
+            strokeWidth={1.75}
+          />
+        ) : null}
+        {agentStatusLabel(status)}
       </span>
     </button>
   );
@@ -137,8 +146,13 @@ export function NotificationBell({ onActivate, onActivateLocal }: Props) {
   const badge = waitingCount + unreadDone;
 
   const refreshHooks = () => {
-    invoke<boolean>("agent_claude_hooks_status")
-      .then(setHooksReady)
+    Promise.all([
+      invoke<boolean>("agent_claude_hooks_status"),
+      invoke<boolean>("agent_codex_notifications_status"),
+    ])
+      .then(([claudeReady, codexReady]) =>
+        setHooksReady(claudeReady && codexReady),
+      )
       .catch(() => setHooksReady(null));
   };
 
@@ -150,10 +164,13 @@ export function NotificationBell({ onActivate, onActivateLocal }: Props) {
     }
   };
 
-  const enableClaudeHooks = async () => {
+  const enableAgentAlerts = async () => {
     setInstalling(true);
     try {
-      await invoke("agent_enable_claude_hooks");
+      await Promise.all([
+        invoke("agent_enable_claude_hooks"),
+        invoke("agent_enable_codex_notifications"),
+      ]);
       setHooksReady(true);
     } catch {
       setHooksReady(false);
@@ -261,12 +278,12 @@ export function NotificationBell({ onActivate, onActivateLocal }: Props) {
                 strokeWidth={1.75}
                 className="text-primary"
               />
-              Claude Code alerts enabled
+              Agent alerts enabled
             </div>
           ) : (
             <button
               type="button"
-              onClick={enableClaudeHooks}
+              onClick={enableAgentAlerts}
               disabled={installing}
               className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-[12px] text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-60"
             >
@@ -276,12 +293,12 @@ export function NotificationBell({ onActivate, onActivateLocal }: Props) {
                 strokeWidth={1.75}
                 className={cn(installing && "animate-spin")}
               />
-              {installing ? "Enabling..." : "Enable Claude Code alerts"}
+              {installing ? "Enabling..." : "Enable agent alerts"}
             </button>
           )}
           {hooksReady === false && !installing ? (
             <p className="px-2 pt-1 text-[11px] text-destructive">
-              Could not update Claude Code config.
+              Could not update agent configs.
             </p>
           ) : null}
         </div>

@@ -1,5 +1,6 @@
 import type { Tab } from "@/modules/tabs";
 import { hasLeaf, leafIdForPty } from "@/modules/terminal";
+import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useEffect, useRef } from "react";
 import { maybeTriggerManagedReview } from "../lib/review";
@@ -78,7 +79,7 @@ function handleSignal(sig: AgentSignal, ctx: Ctx): void {
       return;
     }
     case "finished": {
-      store.setStatus(leafId, "waiting");
+      store.setStatus(leafId, "finished");
       const session = store.sessions[leafId];
       if (session) route(session, "finished", ctx);
       maybeTriggerManagedReview(leafId);
@@ -107,6 +108,7 @@ export function AgentNotificationsBridge({
   useEffect(() => {
     let alive = true;
     let unlisten: (() => void) | undefined;
+    void invoke("agent_enable_codex_notifications").catch(() => {});
     listen<AgentSignal>("terax:agent-signal", (e) =>
       handleSignal(e.payload, ctxRef.current),
     )

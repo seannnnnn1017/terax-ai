@@ -179,6 +179,24 @@ export function resolveTerminalWorkspaceUpdate(
   return { workspaceChanged, restartSession, nextCwd };
 }
 
+export function createTerminalTab(
+  tabId: number,
+  leafId: number,
+  cwd: string | undefined,
+  workspace: WorkspaceEnv = LOCAL_WORKSPACE,
+): TerminalTab {
+  return {
+    id: tabId,
+    kind: "terminal",
+    title: "shell",
+    cwd,
+    workspace,
+    workspaceNonce: 0,
+    paneTree: { kind: "leaf", id: leafId, cwd },
+    activeLeafId: leafId,
+  };
+}
+
 export function useTabs(initial?: Partial<TerminalTab>) {
   const [tabs, setTabs] = useState<Tab[]>(() => {
     const tabId = 1;
@@ -210,20 +228,25 @@ export function useTabs(initial?: Partial<TerminalTab>) {
     const leafId = nextIdRef.current++;
     setTabs((t) => [
       ...t,
-      {
-        id: tabId,
-        kind: "terminal",
-        title: "shell",
-        cwd,
-        workspace: LOCAL_WORKSPACE,
-        workspaceNonce: 0,
-        paneTree: { kind: "leaf", id: leafId, cwd },
-        activeLeafId: leafId,
-      },
+      createTerminalTab(tabId, leafId, cwd),
     ]);
     setActiveId(tabId);
     return tabId;
   }, []);
+
+  const newWorkspaceTab = useCallback(
+    (workspace: WorkspaceEnv, cwd?: string) => {
+      const tabId = nextIdRef.current++;
+      const leafId = nextIdRef.current++;
+      setTabs((t) => [
+        ...t,
+        createTerminalTab(tabId, leafId, cwd, workspace),
+      ]);
+      setActiveId(tabId);
+      return tabId;
+    },
+    [],
+  );
 
   const newAgentTab = useCallback(
     (cwd: string | undefined, title: string) => {
@@ -949,6 +972,7 @@ export function useTabs(initial?: Partial<TerminalTab>) {
     activeId,
     setActiveId,
     newTab,
+    newWorkspaceTab,
     newAgentTab,
     newPrivateTab,
     openFileTab,

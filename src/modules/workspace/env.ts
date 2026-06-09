@@ -49,6 +49,10 @@ export function sameWorkspaceEnv(a: WorkspaceEnv, b: WorkspaceEnv): boolean {
   );
 }
 
+export function workspaceSelectionOpensNewTerminal(env: WorkspaceEnv): boolean {
+  return env.kind === "wsl";
+}
+
 export const useWorkspaceEnvStore = create<State>((set) => ({
   env: LOCAL_WORKSPACE,
   distros: [],

@@ -3,6 +3,7 @@ import { readClipboardText, writeClipboardText } from "@/lib/clipboard";
 import { usePreferencesStore } from "@/modules/settings/preferences";
 import { buildTerminalTheme } from "@/styles/terminalTheme";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { info as logInfo } from "@tauri-apps/plugin-log";
 import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
 import { SerializeAddon } from "@xterm/addon-serialize";
@@ -15,11 +16,22 @@ import {
   terminalLineNavigationSequence,
   terminalWordNavigationSequence,
 } from "./keymap";
+import { focusTerminalInput } from "./focusRecovery";
+import { afterTwoPaintsOrTimeout } from "./paintScheduler";
+import { shouldCreateFreshSlot } from "./terminalSlotOpeningPolicy";
+import { shouldAttachTerminalWebgl } from "./webglPolicy";
 
 export const POOL_MAX_SIZE = 5;
 const FIT_DEBOUNCE_MS = 8;
 const PTY_RESIZE_DEBOUNCE_MS = 256;
 const SNAPSHOT_SCROLLBACK_CAP = 5_000;
+const diagnosticsStartedAt = performance.now();
+const rendererReadyLogged = new Set<number>();
+const keydownLogged = new Set<number>();
+
+function logTerminalTiming(message: string): void {
+  void logInfo(message).catch(() => {});
+}
 
 export type SlotAdapter = {
   resolveLeaf(leafId: number): LeafBridge | null;
@@ -28,6 +40,7 @@ export type SlotAdapter = {
 };
 
 export type LeafBridge = {
+  plainCtrlVPaste: boolean;
   writeToPty(data: string): void;
   resizePty(cols: number, rows: number): void;
   // Force a SIGWINCH on the underlying PTY at the given dims. Implemented
@@ -51,7 +64,7 @@ export type Slot = {
   observer: ResizeObserver | null;
   fitTimer: ReturnType<typeof setTimeout> | null;
   ptyTimer: ReturnType<typeof setTimeout> | null;
-  unhideRaf: number | null;
+  unhideCancel: (() => void) | null;
   lastCols: number;
   lastRows: number;
   lastW: number;
@@ -128,7 +141,7 @@ export function applyBackgroundActive(active: boolean): void {
   }
 }
 
-function createSlot(): Slot {
+function createSlot(initialParent: HTMLElement = getRecycler()): Slot {
   const term = new Terminal(termOptions());
   const fitAddon = new FitAddon();
   const searchAddon = new SearchAddon();
@@ -143,8 +156,11 @@ function createSlot(): Slot {
   const host = document.createElement("div");
   host.style.cssText = "width:100%;height:100%;";
   host.setAttribute("data-terax-slot", String(slots.length));
-  getRecycler().appendChild(host);
+  initialParent.appendChild(host);
   term.open(host);
+  logTerminalTiming(
+    `terminal slot created id=${slots.length} parent=${initialParent.hasAttribute("data-terax-recycler") ? "recycler" : "container"}`,
+  );
 
   const slot: Slot = {
     id: slots.length,
@@ -160,7 +176,7 @@ function createSlot(): Slot {
     observer: null,
     fitTimer: null,
     ptyTimer: null,
-    unhideRaf: null,
+    unhideCancel: null,
     lastCols: term.cols,
     lastRows: term.rows,
     lastW: 0,
@@ -182,6 +198,12 @@ function createSlot(): Slot {
 
     const leafId = slot.currentLeafId;
     if (leafId === null) return false;
+    if (event.type === "keydown" && !keydownLogged.has(leafId)) {
+      keydownLogged.add(leafId);
+      logTerminalTiming(
+        `terminal first keydown leaf=${leafId} after ${Math.round(performance.now() - diagnosticsStartedAt)}ms documentFocused=${document.hasFocus()}`,
+      );
+    }
     const bridge = adapter?.resolveLeaf(leafId);
     if (!bridge) return true;
     const lineNavigation = terminalLineNavigationSequence(event, {
@@ -212,6 +234,7 @@ function createSlot(): Slot {
     const clipboardAction = terminalClipboardAction(event, {
       isMac: IS_MAC,
       hasSelection: slot.term.hasSelection(),
+      plainCtrlVPaste: bridge.plainCtrlVPaste,
     });
     if (clipboardAction === "copy") {
       if (event.type === "keydown" && slot.term.hasSelection()) {
@@ -303,6 +326,18 @@ export function acquireSlot(params: AcquireParams): Slot {
     return existing;
   }
 
+  if (
+    shouldCreateFreshSlot({
+      existingSlotForLeaf: false,
+      poolSize: slots.length,
+      poolMaxSize: POOL_MAX_SIZE,
+    })
+  ) {
+    const slot = createSlot(params.container);
+    bindSlot(slot, params);
+    return slot;
+  }
+
   const pick = pickSlotFor(params.leafId);
   if (pick.previousLeafId !== null) {
     adapter?.evictLeaf(pick.previousLeafId);
@@ -322,6 +357,12 @@ function bindSlot(slot: Slot, p: AcquireParams): void {
     !slot.webglAddon || performance.now() - slot.lastUsedAt > SLOT_STALE_MS;
   slot.currentLeafId = p.leafId;
   slot.lastUsedAt = performance.now();
+  if (!rendererReadyLogged.has(p.leafId)) {
+    rendererReadyLogged.add(p.leafId);
+    logTerminalTiming(
+      `terminal renderer bound leaf=${p.leafId} after ${Math.round(performance.now() - diagnosticsStartedAt)}ms`,
+    );
+  }
 
   cancelPendingUnhide(slot);
   slot.host.style.visibility = "hidden";
@@ -397,29 +438,25 @@ function bindSlot(slot: Slot, p: AcquireParams): void {
 }
 
 function scheduleUnhide(slot: Slot, stale: boolean): void {
-  slot.unhideRaf = requestAnimationFrame(() => {
-    slot.unhideRaf = requestAnimationFrame(() => {
-      slot.unhideRaf = null;
-      slot.host.style.visibility = "";
-      if (stale) {
-        if (!slot.webglAddon) attachWebgl(slot);
-        try {
-          slot.term.refresh(0, slot.term.rows - 1);
-        } catch {}
-      }
-      const leafId = slot.currentLeafId;
-      if (leafId !== null && adapter?.isLeafFocused(leafId)) {
-        slot.term.focus();
-      }
-    });
+  slot.unhideCancel = afterTwoPaintsOrTimeout(() => {
+    slot.unhideCancel = null;
+    slot.host.style.visibility = "";
+    if (stale) {
+      if (!slot.webglAddon) attachWebgl(slot);
+      try {
+        slot.term.refresh(0, slot.term.rows - 1);
+      } catch {}
+    }
+    const leafId = slot.currentLeafId;
+    if (leafId !== null && adapter?.isLeafFocused(leafId)) {
+      focusTerminalInput(slot.term, slot.host);
+    }
   });
 }
 
 function cancelPendingUnhide(slot: Slot): void {
-  if (slot.unhideRaf !== null) {
-    cancelAnimationFrame(slot.unhideRaf);
-    slot.unhideRaf = null;
-  }
+  slot.unhideCancel?.();
+  slot.unhideCancel = null;
 }
 
 function rewireSlot(slot: Slot, p: AcquireParams): void {
@@ -542,7 +579,13 @@ const SLOT_STALE_MS = 10_000;
 
 function attachWebgl(slot: Slot): void {
   if (slot.webglAddon || !slot.term.element) return;
-  if (!usePreferencesStore.getState().terminalWebglEnabled) return;
+  if (
+    !shouldAttachTerminalWebgl(
+      usePreferencesStore.getState().terminalWebglEnabled,
+    )
+  ) {
+    return;
+  }
   const elem = slot.term.element;
   const before = new Set<HTMLCanvasElement>(
     elem.querySelectorAll<HTMLCanvasElement>("canvas"),
@@ -563,7 +606,13 @@ function attachWebgl(slot: Slot): void {
       // forever. Defer past WebKit's reset window before retrying.
       setTimeout(() => {
         if (slot.webglAddon) return;
-        if (!usePreferencesStore.getState().terminalWebglEnabled) return;
+        if (
+          !shouldAttachTerminalWebgl(
+            usePreferencesStore.getState().terminalWebglEnabled,
+          )
+        ) {
+          return;
+        }
         attachWebgl(slot);
         if (slot.webglAddon) {
           try {
@@ -637,8 +686,11 @@ function releaseCanvasContext(canvas: HTMLCanvasElement): void {
 
 export function applyWebglPreference(enabled: boolean): void {
   for (const slot of slots) {
-    if (enabled && !slot.webglAddon) attachWebgl(slot);
-    else if (!enabled && slot.webglAddon) disposeSlotWebgl(slot);
+    if (shouldAttachTerminalWebgl(enabled) && !slot.webglAddon) {
+      attachWebgl(slot);
+    } else if (!shouldAttachTerminalWebgl(enabled) && slot.webglAddon) {
+      disposeSlotWebgl(slot);
+    }
   }
 }
 
@@ -695,7 +747,12 @@ export function applyTheme(): void {
 
 export function focusSlot(leafId: number): void {
   const slot = slots.find((s) => s.currentLeafId === leafId);
-  slot?.term.focus();
+  if (!slot) return;
+  // A focused slot must be keyboard-ready immediately. Waiting for the
+  // repaint scheduler here can leave the first terminal hidden and unfocused
+  // while a newly shown/background WebView throttles animation frames.
+  slot.host.style.visibility = "";
+  focusTerminalInput(slot.term, slot.host);
 }
 
 export function setSlotFocused(leafId: number, focused: boolean): void {

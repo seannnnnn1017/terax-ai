@@ -5,6 +5,7 @@ export {
   isLocalHost,
   LOCAL_WORKSPACE,
   sameWorkspaceEnv,
+  workspaceSelectionOpensNewTerminal,
   workspaceDisplayLabel,
   useWorkspaceEnvStore,
   workspaceScopeKey,

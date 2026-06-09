@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { sameWorkspaceEnv, workspaceScopeKey, type WorkspaceEnv } from "./env";
+import {
+  sameWorkspaceEnv,
+  workspaceScopeKey,
+  workspaceSelectionOpensNewTerminal,
+  type WorkspaceEnv,
+} from "./env";
 
 function sshEnv(rootPath: string): WorkspaceEnv {
   return {
@@ -27,6 +32,16 @@ describe("workspace env identity", () => {
     expect(workspaceScopeKey(sshEnv("/home/sean/Github"))).toBe(
       "ssh:sean@100.72.187.38:22",
     );
+  });
+});
+
+describe("workspace selection behavior", () => {
+  it("opens WSL in a new terminal without replacing the active tab", () => {
+    expect(
+      workspaceSelectionOpensNewTerminal({ kind: "wsl", distro: "Ubuntu" }),
+    ).toBe(true);
+    expect(workspaceSelectionOpensNewTerminal({ kind: "local" })).toBe(false);
+    expect(workspaceSelectionOpensNewTerminal(sshEnv("/home/sean"))).toBe(false);
   });
 });
 

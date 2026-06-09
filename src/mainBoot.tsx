@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 
 type WindowLike = {
   show: () => Promise<void>;
+  setFocus: () => Promise<void>;
 };
 
 type RootLike = {
@@ -28,9 +29,23 @@ function scheduleWindowShow(
   setTimer: Timer,
   logError: (...data: unknown[]) => void,
 ) {
+  let focusPending = false;
+
+  const focusWindow = () => {
+    if (focusPending) return;
+    focusPending = true;
+    currentWindow
+      .setFocus()
+      .catch((e) => logError("window.setFocus failed:", e))
+      .finally(() => {
+        focusPending = false;
+      });
+  };
+
   const showWindow = () => {
     currentWindow
       .show()
+      .then(focusWindow)
       .catch((e) => logError("window.show failed:", e));
   };
 
@@ -70,8 +85,10 @@ export async function startMainWindow({
 }: StartMainWindowOptions) {
   scheduleWindowShow(currentWindow, setTimer, logError);
 
-  void closeAllPtys().catch((e) => logError("pty cleanup failed:", e));
-  await waitForStartupTask(initLaunchDir(), logError);
+  await Promise.all([
+    closeAllPtys().catch((e) => logError("pty cleanup failed:", e)),
+    waitForStartupTask(initLaunchDir(), logError),
+  ]);
 
   if (!root) {
     throw new Error("Missing #root element");

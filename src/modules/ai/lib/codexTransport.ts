@@ -10,6 +10,7 @@ import {
   isCodexModelId as isConfiguredCodexModelId,
 } from "../config";
 import { native, type CodexStreamEvent } from "./native";
+import { selectCodexSpawnCwd } from "./codexWorkspaceCwd";
 
 type LiveSnapshot = {
   cwd: string | null;
@@ -54,7 +55,7 @@ export function runCodexAppServerStream({
     agentPersona,
     planMode,
   });
-  const cwd = live.cwd ?? live.workspaceRoot;
+  const cwd = selectCodexSpawnCwd(live.cwd, live.workspaceRoot);
   const codexModel = codexModelSlug(modelId ?? DEFAULT_CODEX_MODEL_ID);
 
   return Promise.resolve(

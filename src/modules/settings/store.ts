@@ -12,6 +12,7 @@ import {
   type ModelId,
 } from "@/modules/ai/config";
 import type { KeyBinding, ShortcutId } from "@/modules/shortcuts/shortcuts";
+import { defaultTerminalWebglEnabled } from "@/modules/terminal/lib/webglPolicy";
 import type { SshWorkspaceProfile } from "@/modules/workspace";
 import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { LazyStore } from "@tauri-apps/plugin-store";
@@ -183,7 +184,7 @@ export const DEFAULT_PREFERENCES: Preferences = {
   recentModelIds: [],
   vimMode: false,
   showHidden: false,
-  terminalWebglEnabled: true,
+  terminalWebglEnabled: defaultTerminalWebglEnabled(),
   terminalFontFamily: "",
   terminalLetterSpacing: 0,
   terminalFontSize: TERMINAL_FONT_SIZE_DEFAULT,

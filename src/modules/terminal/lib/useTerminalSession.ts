@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { info as logInfo } from "@tauri-apps/plugin-log";
 import { ensureMonoFontsLoaded } from "@/lib/fonts";
 import { usePreferencesStore } from "@/modules/settings/preferences";
 import type { WorkspaceEnv } from "@/modules/workspace";
@@ -27,6 +28,13 @@ import {
   releaseSlot,
   setSlotFocused,
 } from "./rendererPool";
+import { withCurrentSession } from "./sessionEventRouting";
+import { terminalEchoTiming } from "./terminalEchoTiming";
+import { TerminalInputBuffer } from "./terminalInputBuffer";
+import { terminalInputDiagnostics } from "./terminalInputDiagnostics";
+import { terminalRenderRecovery } from "./terminalRenderRecovery";
+import { terminalSlotLifecycleAction } from "./terminalSlotLifecycle";
+import { startTerminalBeforeRendererReady } from "./terminalStartup";
 
 type Callbacks = {
   onSearchReady?: (addon: SearchAddon) => void;
@@ -48,6 +56,7 @@ type Session = {
   focusedNow: boolean;
   disposed: boolean;
   ready: Promise<void>;
+  rendererReady: boolean;
   cols: number;
   rows: number;
   container: HTMLDivElement | null;
@@ -55,10 +64,15 @@ type Session = {
   searchQuery: string | null;
   dormantRing: DormantRing;
   hasSlot: boolean;
+  createdAt: number;
+  lastDormantLogAt: number;
+  outputLogCount: number;
+  lastOutputLogAt: number;
   // True if the slot was in alt-screen mode (TUI like vim, htop, dofek)
   // at the most recent release. Read once on the next bind to trigger a
   // SIGWINCH-driven repaint instead of replaying dormant bytes.
   altScreenAtRelease: boolean;
+  pendingInput: TerminalInputBuffer;
 };
 
 const sessions = new Map<number, Session>();
@@ -98,9 +112,7 @@ export function whenSessionReady(leafId: number, timeoutMs = 4000): Promise<void
 
 export function writeToSession(leafId: number, data: string): boolean {
   const s = sessions.get(leafId);
-  if (!s || !s.pty) return false;
-  void s.pty.write(data);
-  return true;
+  return s ? writeSessionInput(s, data) : false;
 }
 
 /**
@@ -131,8 +143,17 @@ configureRendererPool({
     const s = sessions.get(leafId);
     if (!s) return null;
     return {
+      plainCtrlVPaste: s.workspace.kind === "wsl",
       writeToPty: (data) => {
-        s.pty?.write(data);
+        terminalEchoTiming.markInput(leafId, data);
+        terminalInputDiagnostics.markInput(
+          leafId,
+          "xterm-onData",
+          data,
+          performance.now(),
+          logTerminalTiming,
+        );
+        writeSessionInput(s, data);
       },
       resizePty: (cols, rows) => {
         s.cols = cols;
@@ -180,6 +201,7 @@ function ensureSession(leafId: number, initialCwd?: string): Session {
     focusedNow: false,
     disposed: false,
     ready: Promise.resolve(),
+    rendererReady: false,
     cols: 0,
     rows: 0,
     container: null,
@@ -187,7 +209,12 @@ function ensureSession(leafId: number, initialCwd?: string): Session {
     searchQuery: null,
     dormantRing: new DormantRing(),
     hasSlot: false,
+    createdAt: performance.now(),
+    lastDormantLogAt: 0,
+    outputLogCount: 0,
+    lastOutputLogAt: 0,
     altScreenAtRelease: false,
+    pendingInput: new TerminalInputBuffer(),
   };
   sessions.set(leafId, session);
 
@@ -199,12 +226,109 @@ function ensureSession(leafId: number, initialCwd?: string): Session {
   return session;
 }
 
-function deliverPtyBytes(leafId: number, bytes: Uint8Array): void {
-  const s = sessions.get(leafId);
-  if (!s) return;
-  const slot = getSlotForLeaf(leafId);
-  if (slot) slot.term.write(bytes);
-  else s.dormantRing.push(bytes);
+function writeSessionInput(s: Session, data: string): boolean {
+  if (s.disposed || s.shellExited) return false;
+  if (s.pty) {
+    void s.pty.write(data);
+  } else {
+    s.pendingInput.push(data);
+  }
+  return true;
+}
+
+function logTerminalTiming(message: string): void {
+  void logInfo(message).catch(() => {});
+}
+
+function connectPty(s: Session, pty: PtySession): void {
+  s.pendingInput.flush((data) => {
+    void pty.write(data);
+  });
+  s.pty = pty;
+}
+
+function deliverPtyBytes(
+  leafId: number,
+  source: Session,
+  bytes: Uint8Array,
+): void {
+  withCurrentSession(sessions.get(leafId), source, (s) => {
+    const slot = getSlotForLeaf(leafId);
+    if (slot) {
+      const now = performance.now();
+      s.outputLogCount += 1;
+      const outputSeq = s.outputLogCount;
+      const shouldLogOutput =
+        outputSeq <= 5 ||
+        bytes.length >= 8192 ||
+        now - s.lastOutputLogAt >= 5000;
+      if (shouldLogOutput) {
+        s.lastOutputLogAt = now;
+        logTerminalTiming(
+          `terminal PTY output delivered to renderer leaf=${leafId} seq=${outputSeq} bytes=${bytes.length} sessionAge=${Math.round(now - s.createdAt)}ms rendererReady=${s.rendererReady} visible=${s.visibleNow} focused=${s.focusedNow}`,
+        );
+      }
+      terminalInputDiagnostics.markPtyBytes(
+        leafId,
+        bytes,
+        now,
+        logTerminalTiming,
+      );
+      terminalEchoTiming.markPtyBytes(leafId, now, logTerminalTiming);
+      let writeWatchdog: ReturnType<typeof setTimeout> | null = null;
+      const writeStartedAt = now;
+      if (shouldLogOutput) {
+        writeWatchdog = setTimeout(() => {
+          writeWatchdog = null;
+          logTerminalTiming(
+            `terminal xterm write callback pending leaf=${leafId} seq=${outputSeq} age=5000ms bytes=${bytes.length}`,
+          );
+        }, 5000);
+      }
+      slot.term.write(bytes, () => {
+        if (writeWatchdog !== null) {
+          clearTimeout(writeWatchdog);
+          writeWatchdog = null;
+        }
+        if (shouldLogOutput) {
+          logTerminalTiming(
+            `terminal xterm write callback leaf=${leafId} seq=${outputSeq} after=${Math.round(performance.now() - writeStartedAt)}ms bytes=${bytes.length}`,
+          );
+        }
+        terminalInputDiagnostics.markParsed(
+          leafId,
+          performance.now(),
+          logTerminalTiming,
+        );
+        terminalEchoTiming.markParsed(
+          leafId,
+          performance.now(),
+          logTerminalTiming,
+        );
+        terminalRenderRecovery.requestRefresh(
+          leafId,
+          slot.term,
+          shouldLogOutput ? logTerminalTiming : null,
+        );
+      });
+      terminalRenderRecovery.requestRefresh(
+        leafId,
+        slot.term,
+        shouldLogOutput ? logTerminalTiming : null,
+      );
+    } else {
+      const now = performance.now();
+      const before = s.dormantRing.byteLength();
+      s.dormantRing.push(bytes);
+      const dormantBytes = s.dormantRing.byteLength();
+      if (before === 0 || now - s.lastDormantLogAt >= 5000) {
+        s.lastDormantLogAt = now;
+        logTerminalTiming(
+          `terminal PTY output buffered without renderer leaf=${leafId} bytes=${bytes.length} dormantBytes=${dormantBytes} sessionAge=${Math.round(now - s.createdAt)}ms rendererReady=${s.rendererReady} visible=${s.visibleNow} focused=${s.focusedNow} hasContainer=${!!s.container}`,
+        );
+      }
+    }
+  });
 }
 
 async function openPtyForSession(
@@ -219,14 +343,17 @@ async function openPtyForSession(
     startCols,
     startRows,
     {
-      onData: (bytes) => deliverPtyBytes(leafId, bytes),
+      onData: (bytes) => deliverPtyBytes(leafId, s, bytes),
       onExit: (code) => {
-        s.shellExited = true;
-        s.pty = null;
-        const slot = getSlotForLeaf(leafId);
-        if (slot) slot.term.options.disableStdin = true;
-        if (s.callbacks.onExit) s.callbacks.onExit(code);
-        else s.pendingExit = code;
+        withCurrentSession(sessions.get(leafId), s, (current) => {
+          current.shellExited = true;
+          current.pty = null;
+          current.pendingInput.clear();
+          const slot = getSlotForLeaf(leafId);
+          if (slot) slot.term.options.disableStdin = true;
+          if (current.callbacks.onExit) current.callbacks.onExit(code);
+          else current.pendingExit = code;
+        });
       },
     },
     workspace,
@@ -235,7 +362,13 @@ async function openPtyForSession(
 }
 
 function bindLeafToSlot(leafId: number, s: Session): void {
-  if (!s.container) return;
+  if (!s.container || !s.rendererReady) return;
+  const dormantBytes = s.dormantRing.byteLength();
+  if (dormantBytes > 0) {
+    logTerminalTiming(
+      `terminal renderer binding with buffered output leaf=${leafId} dormantBytes=${dormantBytes} sessionAge=${Math.round(performance.now() - s.createdAt)}ms`,
+    );
+  }
   const altScreen = s.altScreenAtRelease;
   s.altScreenAtRelease = false;
   acquireSlot({
@@ -283,6 +416,7 @@ function bindLeafToSlot(leafId: number, s: Session): void {
 
 function unbindLeafFromSlot(leafId: number, s: Session): void {
   if (!s.hasSlot) return;
+  terminalRenderRecovery.disposeLeaf(leafId);
   const out = releaseSlot(leafId);
   if (out) {
     s.snapshot = out.snapshot;
@@ -304,22 +438,22 @@ function attachSession(
   s.callbacks = callbacks;
   s.container = container;
 
-  if (s.visibleNow) bindLeafToSlot(leafId, s);
-
   if (!s.pty && !s.ptyOpening && !s.shellExited) {
     s.ptyOpening = true;
     openPtyForSession(leafId, s, workspace, s.initialCwd)
       .then((pty) => {
         s.ptyOpening = false;
-        if (s.disposed) {
+        if (s.disposed || s.shellExited) {
+          s.pendingInput.clear();
           pty.close();
           return;
         }
-        s.pty = pty;
+        connectPty(s, pty);
         if (s.cols > 0 && s.rows > 0) pty.resize(s.cols, s.rows);
       })
       .catch((e) => {
         s.ptyOpening = false;
+        s.pendingInput.clear();
         console.error("[terax] openPty failed:", e);
       });
   }
@@ -341,8 +475,13 @@ export async function respawnSession(
   if (!s || s.disposed) return;
   s.pty?.close();
   s.pty = null;
+  s.pendingInput.clear();
   s.snapshot = null;
   s.dormantRing = new DormantRing();
+  s.createdAt = performance.now();
+  s.lastDormantLogAt = 0;
+  s.outputLogCount = 0;
+  s.lastOutputLogAt = 0;
   s.shellExited = false;
   s.pendingExit = null;
   s.altScreenAtRelease = false;
@@ -360,6 +499,7 @@ export async function respawnSession(
     pty = await openPtyForSession(leafId, s, s.workspace, cwd ?? s.initialCwd);
   } catch (e) {
     s.ptyOpening = false;
+    s.pendingInput.clear();
     console.error("[terax] respawn openPty failed:", e);
     return;
   }
@@ -368,7 +508,7 @@ export async function respawnSession(
     pty.close();
     return;
   }
-  s.pty = pty;
+  connectPty(s, pty);
   if (s.cols > 0 && s.rows > 0) pty.resize(s.cols, s.rows);
 }
 
@@ -392,6 +532,8 @@ export function disposeSession(leafId: number): void {
   s.snapshot = null;
   s.pty?.close();
   s.pty = null;
+  s.pendingInput.clear();
+  terminalRenderRecovery.disposeLeaf(leafId);
   sessions.delete(leafId);
   readyLeaves.delete(leafId);
   const waiters = readyWaiters.get(leafId);
@@ -470,21 +612,30 @@ export function useTerminalSession({
     const s = ensureSession(leafId, initialCwd);
     s.visibleNow = visibleRef.current;
     s.focusedNow = focusedRef.current;
-    s.ready.then(() => {
-      if (cancelled || s.disposed) return;
-      const node = container.current;
-      if (!node) return;
-      s.workspace = workspaceRef.current;
-      s.visibleNow = visibleRef.current;
-      s.focusedNow = focusedRef.current;
-      attachSession(leafId, node, workspaceRef.current, {
-        onSearchReady: (a) => cbRef.current.onSearchReady?.(a),
-        onExit: (c) => cbRef.current.onExit?.(c),
-        onCwd: (c, host) => cbRef.current.onCwd?.(c, host),
-        onCommandStart: (command) => commandStartRef.current?.(command),
-      });
-      if (s.visibleNow && s.focusedNow) focusSlot(leafId);
-    });
+    const node = container.current;
+    if (!node) return;
+    s.workspace = workspaceRef.current;
+    s.visibleNow = visibleRef.current;
+    s.focusedNow = focusedRef.current;
+    void startTerminalBeforeRendererReady(
+      () =>
+        attachSession(leafId, node, workspaceRef.current, {
+          onSearchReady: (a) => cbRef.current.onSearchReady?.(a),
+          onExit: (c) => cbRef.current.onExit?.(c),
+          onCwd: (c, host) => cbRef.current.onCwd?.(c, host),
+          onCommandStart: (command) => commandStartRef.current?.(command),
+        }),
+      s.ready,
+      () => {
+        if (cancelled || s.disposed) return;
+        s.rendererReady = true;
+        if (s.visibleNow) bindLeafToSlot(leafId, s);
+        if (s.visibleNow && s.focusedNow) focusSlot(leafId);
+      },
+      {
+        log: (message) => logTerminalTiming(`${message} leaf=${leafId}`),
+      },
+    );
     return () => {
       cancelled = true;
       detachSession(leafId);
@@ -529,23 +680,47 @@ export function useTerminalSession({
     if (!s) return;
     s.visibleNow = visible;
     s.focusedNow = focused;
-    if (visible) {
-      if (s.container && !s.hasSlot) bindLeafToSlot(leafId, s);
-      setSlotFocused(leafId, focused);
-      if (focused) focusSlot(leafId);
-    } else if (s.hasSlot) {
+    const action = terminalSlotLifecycleAction({
+      visible,
+      focused,
+      rendererReady: s.rendererReady,
+      hasContainer: !!s.container,
+      hasSlot: s.hasSlot,
+    });
+    if (action.shouldBind) {
+      bindLeafToSlot(leafId, s);
+    }
+    if (s.hasSlot) {
+      setSlotFocused(leafId, action.slotFocused);
+    }
+    if (action.shouldFocus) {
+      focusSlot(leafId);
+    }
+    if (action.shouldRelease) {
       unbindLeafFromSlot(leafId, s);
     }
   }, [leafId, visible, focused]);
 
   const write = useCallback(
-    (data: string) => sessions.get(leafId)?.pty?.write(data),
+    (data: string) => {
+      const s = sessions.get(leafId);
+      if (s) {
+        terminalInputDiagnostics.markInput(
+          leafId,
+          "session-write",
+          data,
+          performance.now(),
+          logTerminalTiming,
+        );
+        writeSessionInput(s, data);
+      }
+    },
     [leafId],
   );
 
   const focus = useCallback(() => {
     const s = sessions.get(leafId);
-    if (s?.visibleNow && s.container && !s.hasSlot) {
+    if (s?.rendererReady && s.visibleNow && s.container && !s.hasSlot) {
       bindLeafToSlot(leafId, s);
     }
     focusSlot(leafId);

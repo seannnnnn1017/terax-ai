@@ -226,6 +226,8 @@ pub fn run() {
             open_settings_window,
             agent::agent_enable_claude_hooks,
             agent::agent_claude_hooks_status,
+            agent::agent_enable_codex_notifications,
+            agent::agent_codex_notifications_status,
             codex::codex_auth_status,
             codex::codex_login_chatgpt,
             codex::codex_logout,

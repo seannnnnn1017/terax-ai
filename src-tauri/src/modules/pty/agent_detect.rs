@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicU8, Ordering};
+
 const ESC: u8 = 0x1b;
 const BEL: u8 = 0x07;
 const OSC_INTRO: u8 = b']';
@@ -22,6 +24,7 @@ enum State {
 enum Status {
     Working,
     Waiting,
+    Finished,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -31,6 +34,60 @@ pub enum Transition {
     Attention,
     Finished,
     Exited,
+}
+
+const INPUT_INACTIVE: u8 = 0;
+const INPUT_CODEX_WORKING: u8 = 1;
+const INPUT_CODEX_IDLE: u8 = 2;
+
+pub(super) struct AgentInputState {
+    state: AtomicU8,
+}
+
+impl AgentInputState {
+    pub(super) fn new() -> Self {
+        Self {
+            state: AtomicU8::new(INPUT_INACTIVE),
+        }
+    }
+
+    pub(super) fn observe(&self, transition: &Transition) {
+        match transition {
+            Transition::Started { agent } => {
+                let next = if agent == "codex" {
+                    INPUT_CODEX_WORKING
+                } else {
+                    INPUT_INACTIVE
+                };
+                self.state.store(next, Ordering::Release);
+            }
+            Transition::Working => {
+                if self.state.load(Ordering::Acquire) != INPUT_INACTIVE {
+                    self.state.store(INPUT_CODEX_WORKING, Ordering::Release);
+                }
+            }
+            Transition::Attention | Transition::Finished => {
+                if self.state.load(Ordering::Acquire) != INPUT_INACTIVE {
+                    self.state.store(INPUT_CODEX_IDLE, Ordering::Release);
+                }
+            }
+            Transition::Exited => self.state.store(INPUT_INACTIVE, Ordering::Release),
+        }
+    }
+
+    pub(super) fn mark_working_from_input(&self, input: &[u8]) -> bool {
+        if !input.contains(&b'\r') || input.starts_with(b"\x1b[200~") {
+            return false;
+        }
+        self.state
+            .compare_exchange(
+                INPUT_CODEX_IDLE,
+                INPUT_CODEX_WORKING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -77,6 +134,7 @@ pub struct AgentDetector {
     state: State,
     osc: Vec<u8>,
     armed: bool,
+    agent: Option<String>,
     status: Status,
 }
 
@@ -91,6 +149,7 @@ impl AgentDetector {
             state: State::Ground,
             osc: Vec::new(),
             armed: false,
+            agent: None,
             status: Status::Working,
         }
     }
@@ -159,6 +218,7 @@ impl AgentDetector {
 
     fn disarm(&mut self) {
         self.armed = false;
+        self.agent = None;
         self.status = Status::Working;
     }
 
@@ -171,10 +231,30 @@ impl AgentDetector {
         match ps {
             b"133" => self.handle_osc133(pt, emit),
             // OSC 9;4 is taskbar progress, not a notification.
-            b"9" if !pt.starts_with(b"4;") && pt != b"4" => self.generic_attention(emit),
+            b"9" if !pt.starts_with(b"4;") && pt != b"4" => self.handle_osc9(pt, emit),
             b"777" => self.handle_osc777(pt, emit),
             _ => {}
         }
+    }
+
+    pub(super) fn sync_input_state(&mut self, input_state: &AgentInputState) {
+        if self.agent.as_deref() == Some("codex")
+            && input_state.state.load(Ordering::Acquire) == INPUT_CODEX_WORKING
+        {
+            self.status = Status::Working;
+        }
+    }
+
+    fn handle_osc9<F: FnMut(Transition)>(&mut self, pt: &[u8], emit: &mut F) {
+        if self.agent.as_deref() == Some("codex") {
+            if codex_notification_needs_attention(pt) {
+                self.generic_attention(emit);
+            } else {
+                self.set_finished(emit);
+            }
+            return;
+        }
+        self.generic_attention(emit);
     }
 
     fn handle_osc777<F: FnMut(Transition)>(&mut self, pt: &[u8], emit: &mut F) {
@@ -193,8 +273,7 @@ impl AgentDetector {
                 }
                 b"finished" => {
                     self.ensure_armed(emit);
-                    self.status = Status::Waiting;
-                    emit(Transition::Finished);
+                    self.set_finished(emit);
                 }
                 _ => {}
             }
@@ -212,6 +291,7 @@ impl AgentDetector {
                 let cmd = pt.strip_prefix(b"C;").unwrap_or(b"");
                 if let Some(agent) = self.match_agent(cmd) {
                     self.armed = true;
+                    self.agent = Some(agent.clone());
                     self.status = Status::Working;
                     emit(Transition::Started { agent });
                 }
@@ -227,6 +307,7 @@ impl AgentDetector {
     fn ensure_armed<F: FnMut(Transition)>(&mut self, emit: &mut F) {
         if !self.armed {
             self.armed = true;
+            self.agent = Some("claude".into());
             self.status = Status::Working;
             emit(Transition::Started {
                 agent: "claude".into(),
@@ -241,6 +322,13 @@ impl AgentDetector {
         }
     }
 
+    fn set_finished<F: FnMut(Transition)>(&mut self, emit: &mut F) {
+        if self.armed && self.status != Status::Finished {
+            self.status = Status::Finished;
+            emit(Transition::Finished);
+        }
+    }
+
     fn generic_attention<F: FnMut(Transition)>(&mut self, emit: &mut F) {
         if self.armed {
             self.status = Status::Waiting;
@@ -250,22 +338,84 @@ impl AgentDetector {
 
     fn match_agent(&self, cmd: &[u8]) -> Option<String> {
         let cmd = std::str::from_utf8(cmd).ok()?;
-        for token in cmd.split_whitespace() {
-            if token.starts_with('-') {
-                continue;
+        let tokens = command_tokens(cmd);
+        let mut command_idx = tokens.iter().position(|token| !is_env_assignment(token))?;
+        for _ in 0..4 {
+            if let Some(agent) = self.agent_for_executable(&tokens[command_idx]) {
+                return Some(agent);
             }
-            let base = token
-                .rsplit(['/', '\\'])
-                .next()
-                .unwrap_or(token)
-                .trim_matches(['"', '\'']);
-            let base = strip_windows_command_extension(base);
-            if let Some(agent) = self.agents.iter().find(|a| agent_name_matches(base, a)) {
-                return Some(agent.clone());
-            }
+
+            let launcher = executable_base(&tokens[command_idx]).to_ascii_lowercase();
+            command_idx = match launcher.as_str() {
+                "npx" | "bunx" | "pnpx" | "command" | "exec" | "&" | "call" => {
+                    next_non_option(&tokens, command_idx + 1)
+                }
+                "env" => next_env_command(&tokens, command_idx + 1),
+                "npm" | "pnpm" | "yarn" | "bun" => {
+                    let subcommand_idx = next_non_option(&tokens, command_idx + 1)?;
+                    let subcommand = tokens[subcommand_idx].to_ascii_lowercase();
+                    if matches!(subcommand.as_str(), "exec" | "x" | "dlx") {
+                        next_non_option(&tokens, subcommand_idx + 1)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }?;
         }
         None
     }
+
+    fn agent_for_executable(&self, token: &str) -> Option<String> {
+        let base = executable_base(token);
+        self.agents
+            .iter()
+            .find(|agent| agent_name_matches(base, agent))
+            .cloned()
+    }
+}
+
+fn command_tokens(cmd: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    for ch in cmd.chars() {
+        match quote {
+            Some(q) if ch == q => quote = None,
+            Some(_) => current.push(ch),
+            None if ch == '"' || ch == '\'' => quote = Some(ch),
+            None if ch.is_whitespace() => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            None => current.push(ch),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn next_non_option(tokens: &[String], start: usize) -> Option<usize> {
+    (start..tokens.len()).find(|&idx| !tokens[idx].starts_with('-'))
+}
+
+fn next_env_command(tokens: &[String], start: usize) -> Option<usize> {
+    (start..tokens.len())
+        .find(|&idx| !tokens[idx].starts_with('-') && !is_env_assignment(&tokens[idx]))
+}
+
+fn is_env_assignment(token: &str) -> bool {
+    token
+        .split_once('=')
+        .is_some_and(|(name, _)| !name.is_empty() && !name.contains(['/', '\\']))
+}
+
+fn executable_base(token: &str) -> &str {
+    let base = token.rsplit(['/', '\\']).next().unwrap_or(token);
+    strip_windows_command_extension(base)
 }
 
 fn strip_windows_command_extension(base: &str) -> &str {
@@ -283,6 +433,17 @@ fn agent_name_matches(base: &str, agent: &str) -> bool {
     let agent = agent.to_ascii_lowercase();
     base.strip_prefix(agent.as_str())
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('-'))
+}
+
+fn codex_notification_needs_attention(message: &[u8]) -> bool {
+    [
+        b"Approval requested:".as_slice(),
+        b"Approval requested by ".as_slice(),
+        b"Codex wants to edit ".as_slice(),
+        b"Plan mode prompt:".as_slice(),
+    ]
+    .iter()
+    .any(|prefix| message.starts_with(prefix))
 }
 
 #[cfg(test)]
@@ -329,6 +490,18 @@ mod tests {
             run(&mut d2, &osc("133;C;npx claude")),
             vec![started("claude")]
         );
+        let mut d3 = AgentDetector::new();
+        assert_eq!(
+            run(&mut d3, &osc(r#"133;C;"/Applications/Codex Tools/codex""#)),
+            vec![started("codex")]
+        );
+        let mut d4 = AgentDetector::new();
+        assert_eq!(
+            run(&mut d4, &osc("133;C;env TERAX=1 pnpm exec codex")),
+            vec![started("codex")]
+        );
+        let mut d5 = AgentDetector::new();
+        assert_eq!(run(&mut d5, &osc("133;C;& codex")), vec![started("codex")]);
     }
 
     #[test]
@@ -363,6 +536,23 @@ mod tests {
         assert!(run(&mut d, &osc("133;C;vim src/main.rs")).is_empty());
         assert!(run(&mut d, &osc("133;C;cat claude.txt")).is_empty());
         assert!(run(&mut d, &osc("133;C;claudexyz")).is_empty());
+    }
+
+    #[test]
+    fn does_not_arm_when_agent_name_is_only_an_argument() {
+        for command in [
+            "echo codex",
+            "where codex",
+            "which claude",
+            "cat codex",
+            "rg claude src",
+        ] {
+            let mut d = AgentDetector::new();
+            assert!(
+                run(&mut d, &osc(&format!("133;C;{command}"))).is_empty(),
+                "incorrectly armed for {command}"
+            );
+        }
     }
 
     #[test]
@@ -402,7 +592,7 @@ mod tests {
     }
 
     #[test]
-    fn generic_osc777_and_osc9_attention_only_when_armed() {
+    fn generic_notifications_only_emit_when_armed() {
         let mut d = AgentDetector::new();
         assert!(run(&mut d, &osc("777;notify;Other;ready")).is_empty());
         run(&mut d, &osc("133;C;codex"));
@@ -411,10 +601,45 @@ mod tests {
             vec![Transition::Attention]
         );
         assert_eq!(
-            run(&mut d, &osc("9;needs you")),
+            run(&mut d, &osc("9;Approval requested: run tests")),
             vec![Transition::Attention]
         );
         assert!(run(&mut d, &osc("9;4;1;50")).is_empty());
+    }
+
+    #[test]
+    fn codex_osc9_distinguishes_completion_from_attention() {
+        let mut d = AgentDetector::new();
+        run(&mut d, &osc("133;C;codex"));
+        assert_eq!(
+            run(&mut d, &osc("9;Approval requested: run tests")),
+            vec![Transition::Attention]
+        );
+        assert_eq!(
+            run(&mut d, &osc("9;Implemented and verified the fix")),
+            vec![Transition::Finished]
+        );
+    }
+
+    #[test]
+    fn codex_input_state_resumes_without_locking_the_output_detector() {
+        let state = AgentInputState::new();
+        state.observe(&started("codex"));
+        state.observe(&Transition::Finished);
+
+        assert!(!state.mark_working_from_input(b"next task"));
+        assert!(!state.mark_working_from_input(b"\x1b[200~first\rsecond\x1b[201~"));
+        assert!(state.mark_working_from_input(b"\r"));
+        assert!(!state.mark_working_from_input(b"\r"));
+
+        let mut d = AgentDetector::new();
+        run(&mut d, &osc("133;C;codex"));
+        run(&mut d, &osc("9;first turn complete"));
+        d.sync_input_state(&state);
+        assert_eq!(
+            run(&mut d, &osc("9;second turn complete")),
+            vec![Transition::Finished]
+        );
     }
 
     #[test]

@@ -988,8 +988,7 @@ fn ssh_pathspec_from_input(repo_root: &str, rel: &str) -> Result<String> {
     if normalized.is_empty() {
         return Err(GitError::InvalidPath(rel.into()));
     }
-    let input = Path::new(&normalized);
-    if input.is_absolute() {
+    if normalized.starts_with('/') {
         let root = repo_root.trim_end_matches('/');
         if normalized == root {
             return Err(GitError::InvalidPath(rel.into()));

@@ -1,4 +1,6 @@
 use serde_json::{json, Value};
+use std::io::Write;
+use toml_edit::{value as toml_value, Array, DocumentMut, Item, Table};
 
 const HOOK_EVENTS: [(&str, &str); 3] = [
     ("UserPromptSubmit", "working"),
@@ -8,6 +10,11 @@ const HOOK_EVENTS: [(&str, &str); 3] = [
 
 // Includes the pre-v2.1.139 /dev/tty variant so re-running migrates it.
 const OWNED_MARKERS: [&str; 2] = ["notify;Terax;", "terax;notify"];
+const CODEX_NOTIFICATION_EVENTS: [&str; 3] = [
+    "agent-turn-complete",
+    "approval-requested",
+    "plan-mode-prompt",
+];
 
 // Gated on TERAX_TERMINAL; no-op outside Terax. Returns the sequence via
 // `terminalSequence` because hooks lost /dev/tty access in v2.1.139.
@@ -83,6 +90,97 @@ fn settings_path() -> Result<std::path::PathBuf, String> {
         .join("settings.json"))
 }
 
+fn merge_codex_notifications(contents: &str) -> Result<String, String> {
+    let mut doc = if contents.trim().is_empty() {
+        DocumentMut::new()
+    } else {
+        contents
+            .parse::<DocumentMut>()
+            .map_err(|e| format!("config.toml is not valid TOML ({e}); refusing to overwrite"))?
+    };
+    if !doc.contains_key("tui") {
+        doc["tui"] = Item::Table(Table::new());
+    }
+    let tui = doc["tui"]
+        .as_table_mut()
+        .ok_or_else(|| "config.toml [tui] is not a table; refusing to overwrite".to_string())?;
+
+    let mut notifications = Array::new();
+    if let Some(existing) = tui.get("notifications").and_then(Item::as_array) {
+        for event in existing.iter().filter_map(|item| item.as_str()) {
+            if !notifications
+                .iter()
+                .any(|item| item.as_str() == Some(event))
+            {
+                notifications.push(event);
+            }
+        }
+    }
+    for event in CODEX_NOTIFICATION_EVENTS {
+        if !notifications
+            .iter()
+            .any(|item| item.as_str() == Some(event))
+        {
+            notifications.push(event);
+        }
+    }
+
+    tui["notifications"] = toml_value(notifications);
+    tui["notification_method"] = toml_value("osc9");
+    tui["notification_condition"] = toml_value("always");
+    Ok(doc.to_string())
+}
+
+fn codex_notifications_ready(contents: &str) -> bool {
+    let Ok(doc) = contents.parse::<DocumentMut>() else {
+        return false;
+    };
+    let Some(tui) = doc.get("tui").and_then(Item::as_table) else {
+        return false;
+    };
+    let events_ready = match tui.get("notifications") {
+        Some(item) if item.as_bool() == Some(true) => true,
+        Some(item) => item.as_array().is_some_and(|events| {
+            CODEX_NOTIFICATION_EVENTS
+                .iter()
+                .all(|required| events.iter().any(|event| event.as_str() == Some(*required)))
+        }),
+        None => false,
+    };
+    events_ready
+        && tui.get("notification_method").and_then(Item::as_str) == Some("osc9")
+        && tui.get("notification_condition").and_then(Item::as_str) == Some("always")
+}
+
+fn codex_config_path() -> Result<std::path::PathBuf, String> {
+    Ok(dirs::home_dir()
+        .ok_or_else(|| "could not resolve home dir".to_string())?
+        .join(".codex")
+        .join("config.toml"))
+}
+
+fn write_atomic(path: &std::path::Path, contents: &str) -> Result<(), String> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    let permissions = std::fs::metadata(path).ok().map(|meta| meta.permissions());
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)
+        .map_err(|e| format!("create temporary config in {}: {e}", dir.display()))?;
+    tmp.write_all(contents.as_bytes())
+        .map_err(|e| format!("write temporary config: {e}"))?;
+    tmp.as_file()
+        .sync_all()
+        .map_err(|e| format!("sync temporary config: {e}"))?;
+    tmp.persist(path)
+        .map_err(|e| format!("replace {}: {}", path.display(), e.error))?;
+    if let Some(permissions) = permissions {
+        std::fs::set_permissions(path, permissions)
+            .map_err(|e| format!("restore permissions on {}: {e}", path.display()))?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn agent_enable_claude_hooks() -> Result<(), String> {
     let path = settings_path()?;
@@ -120,6 +218,29 @@ pub fn agent_claude_hooks_status() -> bool {
     HOOK_EVENTS
         .iter()
         .all(|(_, m)| content.contains(&format!("notify;Terax;{m}")))
+}
+
+#[tauri::command]
+pub fn agent_enable_codex_notifications() -> Result<(), String> {
+    let path = codex_config_path()?;
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
+    };
+    let merged = merge_codex_notifications(&existing)?;
+    if merged == existing {
+        return Ok(());
+    }
+    write_atomic(&path, &merged)
+}
+
+#[tauri::command]
+pub fn agent_codex_notifications_status() -> bool {
+    codex_config_path()
+        .ok()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .is_some_and(|contents| codex_notifications_ready(&contents))
 }
 
 #[cfg(test)]
@@ -228,5 +349,55 @@ mod tests {
             existing_config(Some(r#"{"permissions":{}}"#), p).unwrap(),
             json!({ "permissions": {} })
         );
+    }
+
+    #[test]
+    fn codex_notifications_preserve_existing_config() {
+        let input = r#"# keep this comment
+model = "gpt-5.5"
+notify = ["existing-notifier", "turn-ended"]
+
+[projects."/tmp/repo"]
+trust_level = "trusted"
+
+[tui]
+animations = false
+notification_method = "bel"
+"#;
+        let out = merge_codex_notifications(input).unwrap();
+        assert!(out.contains("# keep this comment"));
+        assert!(out.contains(r#"notify = ["existing-notifier", "turn-ended"]"#));
+        assert!(out.contains(r#"model = "gpt-5.5""#));
+        assert!(out.contains(r#"trust_level = "trusted""#));
+        assert!(out.contains("animations = false"));
+        assert!(codex_notifications_ready(&out));
+    }
+
+    #[test]
+    fn codex_notifications_are_idempotent_and_keep_custom_events() {
+        let input = r#"[tui]
+notifications = ["custom-event", "agent-turn-complete"]
+"#;
+        let once = merge_codex_notifications(input).unwrap();
+        let twice = merge_codex_notifications(&once).unwrap();
+        assert_eq!(once, twice);
+        assert!(once.contains("custom-event"));
+        assert!(codex_notifications_ready(&once));
+    }
+
+    #[test]
+    fn codex_notifications_preserve_existing_nested_tui_table() {
+        let input = r#"[tui.model_availability_nux]
+"gpt-5.5" = 4
+"#;
+        let out = merge_codex_notifications(input).unwrap();
+        assert!(out.contains(r#""gpt-5.5" = 4"#));
+        assert!(codex_notifications_ready(&out));
+    }
+
+    #[test]
+    fn codex_notifications_refuse_invalid_toml() {
+        assert!(merge_codex_notifications("[tui\nbroken = true").is_err());
+        assert!(!codex_notifications_ready("[tui\nbroken = true"));
     }
 }
