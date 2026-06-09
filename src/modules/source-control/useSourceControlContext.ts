@@ -1,4 +1,5 @@
-import { useCallback, useMemo } from "react";
+﻿import { useCallback, useMemo } from "react";
+import type { WorkspaceEnv } from "@/modules/workspace";
 import { native } from "@/modules/ai/lib/native";
 import type { SidebarViewId } from "@/modules/sidebar";
 import type { Tab } from "@/modules/tabs";
@@ -22,6 +23,7 @@ type Params = {
   home: string | null;
   sidebarView: SidebarViewId;
   cycleSidebarView: (view: SidebarViewId) => void;
+  workspaceEnv?: WorkspaceEnv;
   openCommitHistoryTab: (args: {
     repoRoot: string;
     branch: string | null;
@@ -43,6 +45,7 @@ export function useSourceControlContext({
   home,
   sidebarView,
   cycleSidebarView,
+  workspaceEnv = { kind: "local" },
   openCommitHistoryTab,
 }: Params) {
   const workspaceFallbackPath = launchCwdResolved
@@ -76,7 +79,7 @@ export function useSourceControlContext({
   const sourceControlPath = sourceControlActive
     ? sourceControlContextPath
     : badgeContextPath;
-  const sourceControl = useSourceControl(sourceControlPath, true);
+  const sourceControl = useSourceControl(sourceControlPath, workspaceEnv, true);
 
   const toggleSourceControl = useCallback(() => {
     cycleSidebarView("source-control");

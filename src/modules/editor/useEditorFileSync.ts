@@ -1,4 +1,4 @@
-import { type RefObject, useEffect, useRef } from "react";
+﻿import { type RefObject, useEffect, useRef } from "react";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import {
   listenFsChanged,
@@ -6,6 +6,7 @@ import {
   watchAdd,
   watchRemove,
 } from "@/modules/explorer/lib/watch";
+import type { WorkspaceEnv } from "@/modules/workspace";
 import type { Tab } from "@/modules/tabs";
 import type { EditorPaneHandle } from "./EditorPane";
 
@@ -13,6 +14,7 @@ type Params = {
   tabs: Tab[];
   tabsRef: RefObject<Tab[]>;
   editorRefs: RefObject<Map<number, EditorPaneHandle>>;
+  workspace?: WorkspaceEnv;
 };
 
 /**
@@ -20,7 +22,7 @@ type Params = {
  * diffs, external writes, and fs-watch events, and maintains the watch set for
  * the directories of open editor files.
  */
-export function useEditorFileSync({ tabs, tabsRef, editorRefs }: Params) {
+export function useEditorFileSync({ tabs, tabsRef, editorRefs, workspace = { kind: "local" } }: Params) {
   // When an AI diff is approved (write_file applied to disk), reload any
   // open editor tabs for that path so the user sees the new content. We
   // track which approvalIds we've already handled to fire the reload only
@@ -69,8 +71,8 @@ export function useEditorFileSync({ tabs, tabsRef, editorRefs }: Params) {
     const prev = editorWatchRef.current;
     const toAdd = [...want].filter((d) => !prev.has(d));
     const toRemove = [...prev].filter((d) => !want.has(d));
-    watchAdd(toAdd);
-    watchRemove(toRemove);
+    watchAdd(toAdd, workspace);
+    watchRemove(toRemove, workspace);
     editorWatchRef.current = want;
   }, [tabs]);
 

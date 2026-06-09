@@ -1,4 +1,4 @@
-import { type RefObject, useEffect, useRef } from "react";
+﻿import { type RefObject, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useManagedAgentsStore } from "@/modules/agents/store/managedAgentsStore";
 import {
@@ -10,6 +10,7 @@ import {
 import type { Tab } from "@/modules/tabs";
 import type { Live } from "../store/chatStore";
 import { redactSensitive } from "./redact";
+import { buildTerminalInventory } from "./terminalInventory";
 
 type TuiWaitResult = "ready" | "gone" | "timeout";
 
@@ -91,7 +92,7 @@ export function useAiLiveBridge(params: Params) {
         const t = tabs.find((x) => x.id === activeId);
         return t?.kind === "terminal" && t.private === true;
       },
-      injectIntoActivePty: (text) => {
+      injectIntoActivePty: (text: string) => {
         const { activeId, tabs } = ref.current;
         const t = tabs.find((x) => x.id === activeId);
         if (t?.kind !== "terminal") return false;
@@ -157,6 +158,10 @@ export function useAiLiveBridge(params: Params) {
           useManagedAgentsStore.getState().setPhase(leafId, "working");
         })();
         return { tabId, leafId };
+      },
+      getTerminalInventory: () => {
+        const { activeId, tabs } = ref.current;
+        return buildTerminalInventory(tabs, activeId);
       },
       readLeafBuffer: (leafId: number) => {
         const buf = terminalRefs.current.get(leafId)?.getBuffer(300);

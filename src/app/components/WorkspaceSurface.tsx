@@ -1,4 +1,4 @@
-import type { ComponentProps } from "react";
+﻿import type { ComponentProps } from "react";
 import { cn } from "@/lib/utils";
 import { AiDiffStack, EditorStack, GitDiffStack } from "@/modules/editor";
 import { GitHistoryStack } from "@/modules/git-history";
@@ -21,6 +21,7 @@ type Props = {
   onSearchReady: TerminalStackProps["onSearchReady"];
   onCwd: TerminalStackProps["onCwd"];
   onExit: TerminalStackProps["onExit"];
+  onCommandStart: TerminalStackProps["onCommandStart"];
   onFocusLeaf: TerminalStackProps["onFocusLeaf"];
   registerEditorHandle: EditorStackProps["registerHandle"];
   onEditorDirtyChange: EditorStackProps["onDirtyChange"];
@@ -46,6 +47,7 @@ export function WorkspaceSurface({
   onSearchReady,
   onCwd,
   onExit,
+  onCommandStart,
   onFocusLeaf,
   registerEditorHandle,
   onEditorDirtyChange,
@@ -82,6 +84,7 @@ export function WorkspaceSurface({
           onSearchReady={onSearchReady}
           onCwd={onCwd}
           onExit={onExit}
+          onCommandStart={onCommandStart}
           onFocusLeaf={onFocusLeaf}
         />
       </div>

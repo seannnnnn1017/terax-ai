@@ -36,7 +36,7 @@ import { pushRecentModel } from "../lib/modelPrefs";
 import { createContextAwareTransport } from "../lib/transport";
 import type { ToolContext } from "../tools/tools";
 
-type Live = {
+export type Live = {
   getCwd: () => string | null;
   getTerminalContext: () => string | null;
   getTerminalInventory: () => TerminalInventory;
@@ -182,9 +182,9 @@ const NOOP_LIVE: Live = {
 };
 
 const CHATS_LRU_CAP = 8;
-const chats = new Map<string, Chat<UIMessage>>();
+export const chats = new Map<string, Chat<UIMessage>>();
 
-function touchChat(id: string, c: Chat<UIMessage>) {
+export function touchChat(id: string, c: Chat<UIMessage>) {
   if (chats.has(id)) chats.delete(id);
   chats.set(id, c);
   while (chats.size > CHATS_LRU_CAP) {
@@ -198,7 +198,7 @@ function touchChat(id: string, c: Chat<UIMessage>) {
 }
 // Initial messages for a session, populated at hydration time and consumed
 // when the matching Chat is constructed.
-const seedMessages = new Map<string, UIMessage[]>();
+export const seedMessages = new Map<string, UIMessage[]>();
 
 // Trailing debounce for per-token message persistence. Streaming fires
 // `persistMessages` on every token; without this we'd JSON-serialize the
