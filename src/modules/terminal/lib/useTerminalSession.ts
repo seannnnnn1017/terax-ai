@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+﻿import { invoke } from "@tauri-apps/api/core";
 import { info as logInfo } from "@tauri-apps/plugin-log";
 import { ensureMonoFontsLoaded } from "@/lib/fonts";
 import { usePreferencesStore } from "@/modules/settings/preferences";
@@ -180,7 +180,11 @@ configureRendererPool({
   },
   isLeafFocused(leafId) {
     const s = sessions.get(leafId);
-    return !!s && s.visibleNow && s.focusedNow;
+    return !!s && s.focusedNow;
+  },
+  isLeafVisible(leafId) {
+    const s = sessions.get(leafId);
+    return !!s && s.visibleNow;
   },
 });
 

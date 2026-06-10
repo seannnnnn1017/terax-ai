@@ -1,4 +1,4 @@
-import { detectMonoFontFamily } from "@/lib/fonts";
+﻿import { detectMonoFontFamily } from "@/lib/fonts";
 import { readClipboardText, writeClipboardText } from "@/lib/clipboard";
 import { usePreferencesStore } from "@/modules/settings/preferences";
 import { buildTerminalTheme } from "@/styles/terminalTheme";
@@ -21,7 +21,7 @@ import { afterTwoPaintsOrTimeout } from "./paintScheduler";
 import { shouldCreateFreshSlot } from "./terminalSlotOpeningPolicy";
 import { shouldAttachTerminalWebgl } from "./webglPolicy";
 
-export const POOL_MAX_SIZE = 5;
+export const POOL_MAX_SIZE = 10;
 const FIT_DEBOUNCE_MS = 8;
 const PTY_RESIZE_DEBOUNCE_MS = 256;
 const SNAPSHOT_SCROLLBACK_CAP = 5_000;
@@ -37,6 +37,7 @@ export type SlotAdapter = {
   resolveLeaf(leafId: number): LeafBridge | null;
   evictLeaf(leafId: number): void;
   isLeafFocused(leafId: number): boolean;
+  isLeafVisible(leafId: number): boolean;
 };
 
 export type LeafBridge = {
@@ -288,11 +289,13 @@ function pickSlotFor(leafId: number): PickResult {
   let bestScore = Number.POSITIVE_INFINITY;
   for (const s of slots) {
     if (s.currentLeafId === leafId) return { slot: s, previousLeafId: null };
+    const leafId_ = s.currentLeafId;
+    const visible_ = leafId_ !== null && (adapter?.isLeafVisible(leafId_) ?? false);
     const focused =
-      s.currentLeafId !== null &&
-      (adapter?.isLeafFocused(s.currentLeafId) ?? false);
+      leafId_ !== null &&
+      (adapter?.isLeafFocused(leafId_) ?? false);
     const score =
-      (isAltScreen(s) ? 100 : 0) + (focused ? 10 : 0) + s.lastUsedAt / 1e12;
+      (isAltScreen(s) ? 100 : 0) + (visible_ ? 50 : 0) + (focused ? 10 : 0) + s.lastUsedAt / 1e12;
     if (score < bestScore) {
       bestScore = score;
       best = s;
