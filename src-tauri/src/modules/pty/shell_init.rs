@@ -810,8 +810,12 @@ mod windows {
 
         #[test]
         fn powershell_profile_emits_command_start_marker() {
-            assert!(PROFILE_PS1.contains("AddToHistoryHandler"));
+            assert!(PROFILE_PS1.contains("PSConsoleHostReadLine"));
             assert!(PROFILE_PS1.contains("]133;C;"));
+            // AddToHistoryHandler runs for every saved history line at
+            // PSReadLine init; emitting markers there froze the first
+            // terminal for ~a minute on large history files.
+            assert!(!PROFILE_PS1.contains("-AddToHistoryHandler"));
         }
 
         #[test]

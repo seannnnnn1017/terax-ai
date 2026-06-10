@@ -44,17 +44,21 @@ function global:__terax_emit_preexec {
     return $true
 }
 
+# Emit the OSC 133;C "command started" marker exactly once per executed
+# command by wrapping the host line reader. Never hook AddToHistoryHandler
+# for this: PSReadLine invokes that handler for EVERY line of the saved
+# history file during initialization, which spews thousands of bogus markers
+# through ConPTY and blocks the first interactive prompt for ~a minute on
+# large history files (the "first terminal frozen at startup" bug).
 try {
-    if (Get-Command Set-PSReadLineOption -ErrorAction SilentlyContinue) {
-        $global:__TERAX_USER_ADD_TO_HISTORY_HANDLER = (Get-PSReadLineOption).AddToHistoryHandler
-        Set-PSReadLineOption -AddToHistoryHandler {
-            param([string]$line)
+    # Get-Command auto-imports PSReadLine, which defines PSConsoleHostReadLine.
+    if ((Get-Command Set-PSReadLineOption -ErrorAction SilentlyContinue) -and
+        (Test-Path Function:PSConsoleHostReadLine)) {
+        Copy-Item Function:PSConsoleHostReadLine Function:__terax_user_readline -Force
+        function global:PSConsoleHostReadLine {
+            $line = __terax_user_readline
             __terax_emit_preexec $line | Out-Null
-            $handler = $global:__TERAX_USER_ADD_TO_HISTORY_HANDLER
-            if ($null -ne $handler) {
-                try { return [bool](& $handler $line) } catch { return $true }
-            }
-            return $true
+            $line
         }
     }
 } catch {}
