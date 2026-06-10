@@ -141,6 +141,12 @@ pub fn run() {
         )
         .plugin(tauri_plugin_opener::init())
         .setup(|_app| {
+            // First line of every session log: identifies which build produced
+            // it, so stall reports can be matched to the code that ran.
+            log::info!(
+                "terax boot version={} conpty_serialized_attach=yes echo_watch=yes",
+                env!("CARGO_PKG_VERSION")
+            );
             // macOS skips parent() for the settings window, so tie its lifecycle
             // to the main window here instead. Other platforms keep parent().
             #[cfg(target_os = "macos")]
