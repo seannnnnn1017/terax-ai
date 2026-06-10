@@ -180,6 +180,25 @@ impl SessionDiagnostics {
     }
 }
 
+/// Escaped preview of an output chunk for diagnostics: printable ASCII kept,
+/// ESC/CR/LF abbreviated, everything else hex-escaped.
+fn escape_preview(bytes: &[u8], max: usize) -> String {
+    let mut s = String::with_capacity(max + 8);
+    for &b in bytes.iter().take(max) {
+        match b {
+            0x20..=0x7e => s.push(b as char),
+            0x1b => s.push_str("\\e"),
+            b'\r' => s.push_str("\\r"),
+            b'\n' => s.push_str("\\n"),
+            _ => s.push_str(&format!("\\x{b:02x}")),
+        }
+    }
+    if bytes.len() > max {
+        s.push('…');
+    }
+    s
+}
+
 fn is_terminal_response(data: &[u8]) -> bool {
     if matches!(data, b"\x1b[I" | b"\x1b[O") {
         return true;
@@ -453,6 +472,7 @@ pub fn spawn(
                 flush_seq += 1;
                 let send_started = Instant::now();
                 let chunk_len = chunk.len();
+                let head: Vec<u8> = chunk.iter().take(48).copied().collect();
                 let send_result = on_data_flush.send(Response::new(chunk));
                 let send_ms = send_started.elapsed().as_millis();
                 let should_log = flush_seq <= 5
@@ -464,8 +484,9 @@ pub fn spawn(
                 if should_log {
                     last_flush_log = Some(Instant::now());
                     log::info!(
-                        "pty output flush id={id} seq={flush_seq} bytes={chunk_len} send_ms={send_ms} since_spawn={}ms",
-                        spawn_at.elapsed().as_millis()
+                        "pty output flush id={id} seq={flush_seq} bytes={chunk_len} send_ms={send_ms} since_spawn={}ms preview=\"{}\"",
+                        spawn_at.elapsed().as_millis(),
+                        escape_preview(&head, 48)
                     );
                 }
                 if let Err(e) = send_result {

@@ -77,6 +77,30 @@ const slots: Slot[] = [];
 let recyclerEl: HTMLDivElement | null = null;
 let adapter: SlotAdapter | null = null;
 
+// Where do keystrokes actually land? During the "frozen terminal" bug,
+// typed keys reach no terminal at all — this captures the real DOM focus
+// target so the log shows where they went instead. Throttled to 2/s.
+let lastGlobalKeyLogAt = 0;
+if (typeof document !== "undefined") {
+  document.addEventListener(
+    "keydown",
+    (e) => {
+      const now = performance.now();
+      if (now - lastGlobalKeyLogAt < 500) return;
+      lastGlobalKeyLogAt = now;
+      const ae = document.activeElement;
+      const aeDesc = ae
+        ? `${ae.tagName.toLowerCase()}${ae.className ? "." + String(ae.className).split(" ")[0].slice(0, 40) : ""}`
+        : "none";
+      const slot = slots.find((s) => s.term.element?.contains(ae));
+      logTerminalTiming(
+        `terminal global keydown key=${e.key.length === 1 ? "printable" : e.key} active=${aeDesc} slotLeaf=${slot?.currentLeafId ?? "none"} docFocus=${document.hasFocus()}`,
+      );
+    },
+    true,
+  );
+}
+
 export function configureRendererPool(a: SlotAdapter): void {
   adapter = a;
 }
@@ -198,7 +222,14 @@ function createSlot(initialParent: HTMLElement = getRecycler()): Slot {
     if (event.isComposing || event.keyCode === 229) return false;
 
     const leafId = slot.currentLeafId;
-    if (leafId === null) return false;
+    if (leafId === null) {
+      if (event.type === "keydown") {
+        logTerminalTiming(
+          `terminal keydown dropped: slot=${slot.id} has no leaf`,
+        );
+      }
+      return false;
+    }
     if (event.type === "keydown" && !keydownLogged.has(leafId)) {
       keydownLogged.add(leafId);
       logTerminalTiming(
@@ -369,6 +400,9 @@ function bindSlot(slot: Slot, p: AcquireParams): void {
 
   cancelPendingUnhide(slot);
   slot.host.style.visibility = "hidden";
+  logTerminalTiming(
+    `terminal slot hidden for bind leaf=${p.leafId} slot=${slot.id}`,
+  );
 
   if (slot.host.parentNode !== p.container) {
     p.container.appendChild(slot.host);
@@ -444,6 +478,9 @@ function scheduleUnhide(slot: Slot, stale: boolean): void {
   slot.unhideCancel = afterTwoPaintsOrTimeout(() => {
     slot.unhideCancel = null;
     slot.host.style.visibility = "";
+    logTerminalTiming(
+      `terminal slot unhidden leaf=${slot.currentLeafId} slot=${slot.id} stale=${stale}`,
+    );
     if (stale) {
       if (!slot.webglAddon) attachWebgl(slot);
       try {

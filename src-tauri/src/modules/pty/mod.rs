@@ -178,6 +178,9 @@ pub fn pty_resize(
         });
     if result.is_ok() {
         *session.size.lock().unwrap() = (cols, rows);
+        // Resizes are normally rare (layout changes); a stream of these lines
+        // reveals a resize feedback loop driving conhost redraw storms.
+        log::info!("pty resize id={id} {cols}x{rows}");
     }
     result
 }

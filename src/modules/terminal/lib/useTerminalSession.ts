@@ -268,8 +268,14 @@ function deliverPtyBytes(
         now - s.lastOutputLogAt >= 5000;
       if (shouldLogOutput) {
         s.lastOutputLogAt = now;
+        // DOM truth alongside React state: a pane can claim visible/focused
+        // while its slot host is detached, hidden, or lacks DOM focus.
+        const hostConnected = slot.host.isConnected;
+        const hostVis = slot.host.style.visibility || "visible";
+        const termHasFocus =
+          slot.term.element?.contains(document.activeElement) ?? false;
         logTerminalTiming(
-          `terminal PTY output delivered to renderer leaf=${leafId} seq=${outputSeq} bytes=${bytes.length} sessionAge=${Math.round(now - s.createdAt)}ms rendererReady=${s.rendererReady} visible=${s.visibleNow} focused=${s.focusedNow}`,
+          `terminal PTY output delivered to renderer leaf=${leafId} seq=${outputSeq} bytes=${bytes.length} sessionAge=${Math.round(now - s.createdAt)}ms rendererReady=${s.rendererReady} visible=${s.visibleNow} focused=${s.focusedNow} hostConnected=${hostConnected} hostVis=${hostVis} termHasFocus=${termHasFocus} docFocus=${document.hasFocus()}`,
         );
       }
       terminalInputDiagnostics.markPtyBytes(
