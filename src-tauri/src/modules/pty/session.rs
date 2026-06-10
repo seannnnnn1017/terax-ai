@@ -51,8 +51,58 @@ pub struct Session {
     pub writer: Arc<Mutex<Box<dyn Write + Send>>>,
     pub(super) agent_input_state: Arc<AgentInputState>,
     pub(super) diagnostics: SessionDiagnostics,
+    pub(super) echo_watch: EchoWatch,
+    /// Last size requested via resize; the echo watchdog restores this after
+    /// its unstick jiggle so it never clobbers a user resize.
+    pub(super) size: Mutex<(u16, u16)>,
     // PtyMaster::drop acquires CONPTY_LIFECYCLE_LOCK before ClosePseudoConsole.
     pub master: PtyMaster,
+}
+
+/// Detects a stalled ConPTY: input was written but the console produced no
+/// output. A healthy shell echoes within tens of ms; a corrupted/stalled
+/// conhost buffers input silently until a resize kicks it. Armed on each
+/// interactive write, cleared by the reader on any output.
+pub(super) struct EchoWatch {
+    // (armed_at, kicks_fired_for_this_arm)
+    pending: Mutex<Option<(Instant, u32)>>,
+}
+
+impl EchoWatch {
+    fn new() -> Self {
+        Self {
+            pending: Mutex::new(None),
+        }
+    }
+
+    pub(super) fn arm(&self, data: &[u8]) {
+        if is_terminal_response(data) {
+            return;
+        }
+        let mut g = self.pending.lock().unwrap();
+        if g.is_none() {
+            *g = Some((Instant::now(), 0));
+        }
+    }
+
+    fn clear(&self) {
+        *self.pending.lock().unwrap() = None;
+    }
+
+    /// True when the oldest unanswered input has waited past `threshold`.
+    /// Re-arms with a fresh timestamp so kicks repeat up to `max_kicks`.
+    #[cfg(windows)]
+    fn should_kick(&self, threshold: Duration, max_kicks: u32) -> bool {
+        let mut g = self.pending.lock().unwrap();
+        match g.as_mut() {
+            Some((armed_at, kicks)) if *kicks < max_kicks && armed_at.elapsed() >= threshold => {
+                *kicks += 1;
+                *armed_at = Instant::now();
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 impl Drop for Session {
@@ -224,15 +274,20 @@ pub fn spawn(
     let spawn_at = Instant::now();
     let pty_system = native_pty_system();
     let size = PtySize { rows, cols, pixel_width: 0, pixel_height: 0 };
-    // Hold lock only around CreatePseudoConsole, not slow shell startup.
-    let pair = {
+    let cmd = shell_init::build_command(cwd, workspace)?;
+    // Hold the lock across BOTH CreatePseudoConsole and the CreateProcess that
+    // attaches the shell to it. Letting an attach overlap another console's
+    // create/close corrupts the new console: conhost buffers I/O but pumps
+    // nothing until a later resize kicks it (issue #356 — narrowing this to
+    // openpty alone reintroduced the "one terminal frozen at startup" stall).
+    // Shell startup (profile load etc.) happens after attach, outside the lock.
+    let (pair, mut child) = {
         #[cfg(windows)]
         let _spawn_guard = CONPTY_LIFECYCLE_LOCK.lock().unwrap();
-        pty_system.openpty(size).map_err(|e| e.to_string())?
+        let pair = pty_system.openpty(size).map_err(|e| e.to_string())?;
+        let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
+        (pair, child)
     };
-
-    let cmd = shell_init::build_command(cwd, workspace)?;
-    let mut child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
     drop(pair.slave);
 
     // Kill the child if any of the pipe setup below fails so the spawned shell
@@ -267,6 +322,8 @@ pub fn spawn(
         writer: writer.clone(),
         agent_input_state: Arc::new(AgentInputState::new()),
         diagnostics: SessionDiagnostics::new(spawn_at),
+        echo_watch: EchoWatch::new(),
+        size: Mutex::new((cols, rows)),
         master: PtyMaster::new(pair.master),
     });
     let agent_input_state = session.agent_input_state.clone();
@@ -293,6 +350,7 @@ pub fn spawn(
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
+                        session_for_diagnostics.echo_watch.clear();
                         if !logged_first {
                             logged_first = true;
                             log::info!(
@@ -420,7 +478,7 @@ pub fn spawn(
 
     let on_data_exit = on_data;
     let pending_e = pending;
-    let done_e = done;
+    let done_e = done.clone();
     thread::Builder::new()
         .name("terax-pty-waiter".into())
         .spawn(move || {
@@ -459,6 +517,49 @@ pub fn spawn(
         })
         .expect("spawn pty waiter thread");
 
+    // ConPTY stall recovery: if input goes unanswered, jiggle the console
+    // size to force conhost to start pumping. Normal echo round-trips in
+    // tens of ms, so a 1.5s silence after a keystroke means conhost stalled.
+    #[cfg(windows)]
+    {
+        const KICK_AFTER: Duration = Duration::from_millis(1500);
+        const MAX_KICKS: u32 = 3;
+        let weak = std::sync::Arc::downgrade(&session);
+        let done_w = done.clone();
+        thread::Builder::new()
+            .name(format!("terax-pty-echo-watch-{id}"))
+            .spawn(move || loop {
+                thread::sleep(Duration::from_millis(500));
+                if done_w.load(Ordering::Acquire) {
+                    return;
+                }
+                let Some(s) = weak.upgrade() else { return };
+                if !s.echo_watch.should_kick(KICK_AFTER, MAX_KICKS) {
+                    continue;
+                }
+                let (c, r) = *s.size.lock().unwrap();
+                log::warn!(
+                    "pty input unanswered id={id} for {}ms: kicking conpty with resize jiggle ({c}x{r})",
+                    KICK_AFTER.as_millis()
+                );
+                if let Ok(m) = s.master.lock() {
+                    let _ = m.resize(PtySize {
+                        rows: r + 1,
+                        cols: c,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    });
+                    let _ = m.resize(PtySize {
+                        rows: r,
+                        cols: c,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    });
+                };
+            })
+            .expect("spawn pty echo watch thread");
+    }
+
     Ok((session, size))
 }
 
@@ -494,6 +595,8 @@ mod tests {
             writer,
             agent_input_state: Arc::new(AgentInputState::new()),
             diagnostics: SessionDiagnostics::new(Instant::now()),
+            echo_watch: EchoWatch::new(),
+            size: Mutex::new((80, 24)),
             master: PtyMaster::new(pair.master),
         });
 
@@ -544,6 +647,8 @@ mod tests {
             writer,
             agent_input_state: Arc::new(AgentInputState::new()),
             diagnostics: SessionDiagnostics::new(Instant::now()),
+            echo_watch: EchoWatch::new(),
+            size: Mutex::new((80, 24)),
             master: PtyMaster::new(pair.master),
         });
 

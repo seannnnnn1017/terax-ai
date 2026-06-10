@@ -133,12 +133,14 @@ pub fn pty_write(
             result.is_ok()
         );
     }
-    if result.is_ok()
-        && session
+    if result.is_ok() {
+        session.echo_watch.arm(data.as_bytes());
+        if session
             .agent_input_state
             .mark_working_from_input(data.as_bytes())
-    {
-        let _ = app.emit(session::AGENT_EVENT, Transition::Working.into_signal(id));
+        {
+            let _ = app.emit(session::AGENT_EVENT, Transition::Working.into_signal(id));
+        }
     }
     result
 }
@@ -174,6 +176,9 @@ pub fn pty_resize(
             log::warn!("pty_resize id={id} failed: {e}");
             e.to_string()
         });
+    if result.is_ok() {
+        *session.size.lock().unwrap() = (cols, rows);
+    }
     result
 }
 

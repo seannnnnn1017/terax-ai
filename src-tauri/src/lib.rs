@@ -134,6 +134,9 @@ pub fn run() {
         .plugin(
             tauri_plugin_log::Builder::new()
                 .level(tauri_plugin_log::log::LevelFilter::Info)
+                // Default 40KB rotation discards the start of a session's log,
+                // which is exactly the part needed to diagnose startup stalls.
+                .max_file_size(5_000_000)
                 .build(),
         )
         .plugin(tauri_plugin_opener::init())
